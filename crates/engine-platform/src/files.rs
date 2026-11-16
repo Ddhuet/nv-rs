@@ -1938,9 +1938,14 @@ fn player_entry(path: &[u8]) -> Option<Entry> {
 /// extension of three characters or fewer; for a longer extension they differ (`d.esmx`: ntdll
 /// `D6104~1.ES~`, NTFS `D6104~1.ESM`), so such a name's short name is `None` (not provided), as
 /// it is elsewhere than on Windows. Under Wine (Proton) ntdll's `RtlGenerate8dot3Name` is a stub
-/// that ends the process when called, so there no name gets a short name (`None`), as elsewhere.
+/// that ends the process when called; there the name is the one Wine's own directory listing
+/// gives it ([`wine_short_name`]).
 fn short_name(e: &Engine, path: &[u8]) -> Option<String> {
     let name = last_part(path);
+    #[cfg(windows)]
+    if ntdll::is_wine() {
+        return Some(wine_short_name(&name));
+    }
     if short_extension(&name).is_none() {
         return Some(String::new());
     }
@@ -1950,9 +1955,6 @@ fn short_name(e: &Engine, path: &[u8]) -> Option<String> {
     }
     #[cfg(windows)]
     {
-        if ntdll::is_wine() {
-            return None;
-        }
         let cut = last_separator(path)?;
         let taken = names_in(e, &path[..cut]);
         let mut generator = ntdll::Generator::new(&name);
@@ -1965,6 +1967,105 @@ fn short_name(e: &Engine, path: &[u8]) -> Option<String> {
         let _ = e;
         None
     }
+}
+
+/// The 8.3 short name Wine's directory listing shows for `name` (Wine's ntdll,
+/// `dlls/ntdll/unix/file.c`: `is_legal_8dot3_name`, `hash_short_file_name`, then upper case):
+/// empty for a legal 8.3 name; otherwise up to four characters of the name (dots left out,
+/// characters DOS does not allow as `_`), `~` up to five, three characters of a hash of the
+/// whole name, and up to three characters of the last extension. Wine makes it from the name
+/// alone each time it lists the directory, so it does not depend on the directory's other names.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wine_short_name(name: &str) -> String {
+    const HASH_CHARS: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let dos_invalid = |c: u16| c > 0x7f || b"*?<>|\"+=,;[] ~.".contains(&(c as u8));
+    let legal = || {
+        let len = units.len();
+        if len > 12 {
+            return false;
+        }
+        if len > 0 && units[0] == u16::from(b'.') {
+            return len == 1 || (len == 2 && units[1] == u16::from(b'.'));
+        }
+        let mut dot = None;
+        for (i, &c) in units.iter().enumerate() {
+            if c > 0x7f || b"*?<>|\"+=,;[] :/\\".contains(&(c as u8)) {
+                return false;
+            }
+            if c == u16::from(b'.') {
+                if dot.is_some() {
+                    return false;
+                }
+                dot = Some(i);
+            }
+        }
+        match dot {
+            None => len <= 8,
+            Some(dot) => dot <= 8 && len - dot > 1 && len - dot < 5,
+        }
+    };
+    if units.is_empty() || legal() {
+        return String::new();
+    }
+    let lower = |c: u16| -> u16 {
+        char::from_u32(u32::from(c))
+            .map(|ch| {
+                let mut l = ch.to_lowercase();
+                match (l.next(), l.next()) {
+                    (Some(one), None) if (one as u32) <= 0xffff => one as u16,
+                    _ => c,
+                }
+            })
+            .unwrap_or(c)
+    };
+    let end = units.len();
+    let mut hash: u16 = 0xbeef;
+    for p in 0..end - 1 {
+        hash = (hash << 3) ^ (hash >> 5) ^ lower(units[p]) ^ (lower(units[p + 1]) << 8);
+    }
+    hash = (hash << 3) ^ (hash >> 5) ^ lower(units[end - 1]);
+
+    let dot = u16::from(b'.');
+    let mut start = 0;
+    while start < end && units[start] == dot {
+        start += 1;
+    }
+    let ext = (start + 1..end.saturating_sub(1))
+        .rev()
+        .find(|&p| units[p] == dot);
+
+    let mut out: Vec<u16> = Vec::with_capacity(12);
+    let mut left = 4i32;
+    let mut p = 0;
+    while left > 0 {
+        if p == end || Some(p) == ext {
+            break;
+        }
+        if units[p] != dot {
+            out.push(if dos_invalid(units[p]) {
+                u16::from(b'_')
+            } else {
+                units[p]
+            });
+            left -= 1;
+        }
+        p += 1;
+    }
+    while left >= 0 {
+        out.push(u16::from(b'~'));
+        left -= 1;
+    }
+    for shift in [10, 5, 0] {
+        out.push(u16::from(HASH_CHARS[usize::from((hash >> shift) & 0x1f)]));
+    }
+    if let Some(ext) = ext {
+        out.push(dot);
+        for &c in units[ext + 1..].iter().take(3) {
+            out.push(if dos_invalid(c) { u16::from(b'_') } else { c });
+        }
+    }
+    String::from_utf16_lossy(&out).to_uppercase()
 }
 
 /// Every long and short name the directory at the full path `directory` holds now, upper case:
@@ -5261,5 +5362,38 @@ mod tests_code_pages {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod tests_wine_short_names {
+    use super::wine_short_name;
+
+    /// Wine's own answers: Proton 11.0's `cmd /c dir /x` of empty files with these names.
+    #[test]
+    fn wine_short_names_are_wines() {
+        for (name, short) in [
+            ("a b.esm", "A_B~~TF0.ESM"),
+            ("abcdefghi.txt", "ABCD~0SH.TXT"),
+            ("autosave.fos", ""),
+            ("autosave.nvse", "AUTO~KGM.NVS"),
+            ("c.esm.bak", "CESM~DJF.BAK"),
+            ("d.esmx", "D~~~~ENO.ESM"),
+            ("FalloutNV.esm", "FALL~FJ4.ESM"),
+            ("lower.txt", ""),
+            ("nvfix.fos", ""),
+            ("Quicksave.fos", "QUIC~LJE.FOS"),
+            ("Save 1   Vikki  Goodsprings  00 28 55.fos", "SAVE~VJO.FOS"),
+            ("Save 1   Vikki  Goodsprings  00 28 55.nvse", "SAVE~FDC.NVS"),
+            (
+                "Save 12   Vikki  Doc Mitchell's House  00 01 02.fos",
+                "SAVE~3DS.FOS",
+            ),
+            ("x+y.txt", "X_Y~~GTY.TXT"),
+            (".", ""),
+            ("..", ""),
+        ] {
+            assert_eq!(wine_short_name(name), short, "{name}");
+        }
     }
 }
