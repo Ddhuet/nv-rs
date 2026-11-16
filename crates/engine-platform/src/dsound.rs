@@ -385,7 +385,38 @@ pub struct Table {
     /// `SetFX` / `GetObjectInPath` by (effect, buffer has `DSBCAPS_CTRLFX`): `SetFX`'s result,
     /// its result code, `GetObjectInPath`'s result.
     effects: BTreeMap<(String, bool), (u32, u32, u32)>,
+    /// The capture came from Wine's DirectSound (Proton), see [`Table::wine_capture`].
+    wine: bool,
 }
+
+/// The `CreateSoundBuffer` rules that differ between DirectSound implementations. Windows
+/// (measured, see the module documentation) refuses a `DSBCAPS_CTRLFX` buffer under 150 ms
+/// with `DSERR_BUFFERTOOSMALL` and answers a 3D buffer with `DS3DALG_HRTF_LIGHT`
+/// `DS_NO_VIRTUALIZATION`. Wine's dsound (a Proton capture on Linux, 2026-11-16, 3,724 lines)
+/// makes the short `DSBCAPS_CTRLFX` buffer and answers the HRTF one `DS_OK`. The layer always
+/// answers the game as Windows does; a Wine capture is checked against Wine's rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rules {
+    fx_minimum: bool,
+    hrtf_no_virtualization: bool,
+}
+
+impl Rules {
+    const WINDOWS: Rules = Rules {
+        fx_minimum: true,
+        hrtf_no_virtualization: true,
+    };
+    const WINE: Rules = Rules {
+        fx_minimum: false,
+        hrtf_no_virtualization: false,
+    };
+}
+
+const E_NOTIMPL: u32 = 0x8000_4001;
+const REGDB_E_CLASSNOTREG: u32 = 0x8004_0154;
+const DSERR_OBJECTNOTFOUND: u32 = 0x8878_1161;
+const DSFXR_LOCSOFTWARE: u32 = 2;
+const DSFXR_UNKNOWN: u32 = 5;
 
 fn hex(text: &str) -> u32 {
     u32::from_str_radix(text, 16)
@@ -406,18 +437,23 @@ fn disagree(line: &str, rule: impl std::fmt::Display) -> ! {
     panic!("the sound table disagrees with the layer ({rule}): {line}; re-capture it or report it")
 }
 
-/// The answer the layer gives a secondary `CreateSoundBuffer` (see the module documentation).
-fn create_result(kind: Kind, bytes: u32) -> u32 {
-    let (flags, hrtf, _, channels, rate, bits) = kind;
+/// Whether a `DSBCAPS_CTRLFX` request is under the 150 ms Windows refuses.
+fn fx_too_small(kind: Kind, bytes: u32) -> bool {
+    let (flags, _, _, channels, rate, bits) = kind;
     let align = u32::from(channels) * u32::from(bits) / 8;
+    flags & DSBCAPS_CTRLFX != 0 && u64::from(bytes / align) < u64::from(rate) * 150 / 1000
+}
+
+/// The answer the layer gives a secondary `CreateSoundBuffer` (see the module documentation).
+fn create_result(kind: Kind, bytes: u32, rules: Rules) -> u32 {
+    let (flags, hrtf, _, channels, ..) = kind;
     if bytes < MIN_BUFFER_BYTES {
         DSERR_INVALIDPARAM
-    } else if flags & DSBCAPS_CTRLFX != 0 && u64::from(bytes / align) < u64::from(rate) * 150 / 1000
-    {
+    } else if rules.fx_minimum && fx_too_small(kind, bytes) {
         DSERR_BUFFERTOOSMALL
     } else if flags & DSBCAPS_CTRL3D != 0 && channels != 1 {
         DSERR_INVALIDPARAM
-    } else if flags & DSBCAPS_CTRL3D != 0 && hrtf {
+    } else if flags & DSBCAPS_CTRL3D != 0 && hrtf && rules.hrtf_no_virtualization {
         DS_NO_VIRTUALIZATION
     } else {
         DS_OK
@@ -446,7 +482,10 @@ fn distortion_ok(p: [f32; 5]) -> bool {
 impl Table {
     /// Parses and checks a capture.
     pub fn parse(text: &str) -> Table {
-        let mut t = Table::default();
+        let mut t = Table {
+            wine: Table::wine_capture(text),
+            ..Table::default()
+        };
         let mut ended = false;
         for line in text.lines().filter(|l| !l.is_empty()) {
             let f: Vec<&str> = line.split('\t').collect();
@@ -464,7 +503,7 @@ impl Table {
                 }
                 "DsBuffer" => t.check_buffer(line, &f),
                 "DsFx" => t.check_effect(line, &f),
-                "DsSet" => check_setting(line, &f),
+                "DsSet" => check_setting(line, &f, t.wine),
                 "DsCursor" => {}
                 "DsEnd" => ended = true,
                 other => panic!("the sound table has a line this layer does not know: {other}"),
@@ -482,7 +521,12 @@ impl Table {
         let kind: Kind = (w[0], w[1] != 0, w[2] as u16, w[3] as u16, w[4], w[5] as u16);
         let size = w[6];
         let result = hex(f[2]);
-        let want = create_result(kind, size);
+        let rules = if self.wine {
+            Rules::WINE
+        } else {
+            Rules::WINDOWS
+        };
+        let want = create_result(kind, size, rules);
         if result != want {
             disagree(line, format!("CreateSoundBuffer answers {want:x}"));
         }
@@ -517,7 +561,7 @@ impl Table {
 
     fn check_effect(&mut self, line: &str, f: &[&str]) {
         let w: Vec<&str> = f[1].split(' ').collect();
-        if f[2].starts_with("create") {
+        if self.wine || f[2].starts_with("create") {
             return;
         }
         let flags = hex(w[1]);
@@ -530,8 +574,32 @@ impl Table {
         }
     }
 
-    /// The captured answer to `SetFX`/`GetObjectInPath` for this effect.
+    /// Whether a capture came from Wine's DirectSound (Proton) rather than Windows': Wine's
+    /// distortion DMO is a stub whose `SetAllParameters` answers `E_NOTIMPL`, which Windows'
+    /// never does. Wine's effects are stubs (its I3DL2 reverb also answers `DS_OK` where
+    /// Windows has no reverb), and this layer makes the effects itself, so with a Wine capture
+    /// the layer answers `SetFX` and `GetObjectInPath` as measured on Windows (module
+    /// documentation). The device's own answers (caps, the primary buffer, the listener)
+    /// still come from the capture.
+    fn wine_capture(text: &str) -> bool {
+        text.lines().any(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            f[0] == "DsSet"
+                && f.get(1).is_some_and(|w| w.starts_with("distortion "))
+                && f.get(2) == Some(&"80004001")
+        })
+    }
+
+    /// The captured answer to `SetFX`/`GetObjectInPath` for this effect (Windows' measured
+    /// answer for a Wine capture, see [`Table::wine_capture`]).
     fn effect(&self, name: &str, fx: bool) -> (u32, u32, u32) {
+        if self.wine {
+            return match (name, fx) {
+                (_, false) => (DSERR_CONTROLUNAVAIL, u32::MAX, DSERR_CONTROLUNAVAIL),
+                ("distortion", true) => (DS_OK, DSFXR_LOCSOFTWARE, DS_OK),
+                (_, true) => (REGDB_E_CLASSNOTREG, DSFXR_UNKNOWN, DSERR_OBJECTNOTFOUND),
+            };
+        }
         *self
             .effects
             .get(&(name.to_string(), fx))
@@ -559,7 +627,7 @@ fn format_bytes(tag: u16, channels: u16, rate: u32, bits: u16) -> Vec<u8> {
 }
 
 /// Checks a `DsSet` line against the layer's rules.
-fn check_setting(line: &str, f: &[&str]) {
+fn check_setting(line: &str, f: &[&str], wine: bool) {
     let w: Vec<&str> = f[1].split(' ').collect();
     // The 3D buffer's defaults line has two results (the query's and `GetAllParameters`').
     let result = hex(f[2].split(' ').next().unwrap_or_default());
@@ -570,6 +638,8 @@ fn check_setting(line: &str, f: &[&str]) {
     };
     let ok = |good: bool| if good { DS_OK } else { DSERR_INVALIDPARAM };
     match w.as_slice() {
+        // Wine's distortion is a stub (`Table::wine_capture`).
+        ["distortion", _] if wine => expect(E_NOTIMPL),
         ["distortion", gain] => {
             let g = f32::from_bits(hex(gain));
             expect(ok(distortion_ok([g, 0.0, 5000.0, 1135.0, 5000.0])));
@@ -585,6 +655,8 @@ fn check_setting(line: &str, f: &[&str]) {
             });
         }
         [_, "frequency", v] => expect(ok(frequency_ok(hex(v)))),
+        // Wine accepts any distance (Wine's `IDirectSound3DBuffer` checks none).
+        ["3dbuffer", "mindistance" | "maxdistance", _] if wine => {}
         ["3dbuffer", "mindistance" | "maxdistance", v] => {
             expect(ok(f32::from_bits(hex(v)) > 0.0));
         }
@@ -2260,7 +2332,8 @@ fn create_sound_buffer(e: &mut Engine, this: Ptr, desc: Ptr, out: Ptr, outer: u3
              algorithm {alg:x?}, format {}, {size} bytes) is not provided",
             hex_string(&f)
         );
-        let result = create_result(kind, size);
+        // Windows' answers also with a Wine capture: the game asks for what Windows makes.
+        let result = create_result(kind, size, Rules::WINDOWS);
         if (result as i32) < 0 {
             return result;
         }
@@ -4228,7 +4301,7 @@ mod tests {
             (0x302b0, 1, 1, 44100),
         ] {
             let kind: Kind = (flags, alg != 0, 1, channels, 22050, 16);
-            let result = create_result(kind, size);
+            let result = create_result(kind, size, Rules::WINDOWS);
             let words = format!("{flags:x} {alg} 1 {channels:x} 5622 10 {size:x}");
             if (result as i32) < 0 {
                 t += &format!("DsBuffer\t{words}\t{result:x}\t\t\t\t\n");
@@ -6455,6 +6528,52 @@ mod tests {
             "DsBuffer\t2e0 0 1 1 5622 10 3\t0",
         );
         Table::parse(&text);
+    }
+
+    /// A capture from Wine's dsound (Proton): its distortion is a stub, its buffer rules
+    /// differ and its reverb answers `DS_OK`. The table loads, and the layer keeps Windows'
+    /// answers for the game.
+    #[test]
+    fn a_wine_capture_loads_and_the_layer_answers_as_windows() {
+        let mut text = String::new();
+        for l in table_text().lines() {
+            // Wine makes the short `DSBCAPS_CTRLFX` buffer Windows refuses.
+            if l.starts_with("DsBuffer\t2e0 0 1 1 5622 10 19d4\t887800b4") {
+                continue;
+            }
+            let l = if l.starts_with("DsSet\tdistortion ") {
+                let f: Vec<&str> = l.split('\t').collect();
+                format!("{}\t{}\t80004001\t{}", f[0], f[1], f[3..].join("\t"))
+            } else if l.starts_with("DsFx\ti3dl2 2e0") {
+                l.replace("80040154\t5\t88781161", "0\t2\t0")
+            } else {
+                l.replace(
+                    "DsBuffer\t302b0 1 1 1 5622 10 ac44\t878000a\t",
+                    "DsBuffer\t302b0 1 1 1 5622 10 ac44\t0\t",
+                )
+            };
+            text += &l;
+            text.push('\n');
+        }
+        let t = Table::parse(&text);
+        assert!(t.wine);
+        assert_eq!(
+            t.effect("i3dl2", true),
+            (REGDB_E_CLASSNOTREG, DSFXR_UNKNOWN, DSERR_OBJECTNOTFOUND)
+        );
+        assert_eq!(
+            t.effect("distortion", true),
+            (DS_OK, DSFXR_LOCSOFTWARE, DS_OK)
+        );
+        assert!(!Table::parse(&table_text()).wine);
+    }
+
+    /// The player's own capture, when `NV_DSOUND_TABLE_CHECK` names one, loads.
+    #[test]
+    fn the_named_capture_loads() {
+        if let Some(path) = std::env::var_os("NV_DSOUND_TABLE_CHECK") {
+            Table::parse(&std::fs::read_to_string(path).expect("the capture"));
+        }
     }
 
     #[test]

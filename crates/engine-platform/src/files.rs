@@ -1937,7 +1937,8 @@ fn player_entry(path: &[u8]) -> Option<Entry> {
 /// `gen-2026-11-03.tsv`): ntdll's names were NTFS's for all 25 long names measured with an
 /// extension of three characters or fewer; for a longer extension they differ (`d.esmx`: ntdll
 /// `D6104~1.ES~`, NTFS `D6104~1.ESM`), so such a name's short name is `None` (not provided), as
-/// it is elsewhere than on Windows.
+/// it is elsewhere than on Windows. Under Wine (Proton) ntdll's `RtlGenerate8dot3Name` is a stub
+/// that ends the process when called, so there no name gets a short name (`None`), as elsewhere.
 fn short_name(e: &Engine, path: &[u8]) -> Option<String> {
     let name = last_part(path);
     if short_extension(&name).is_none() {
@@ -1949,6 +1950,9 @@ fn short_name(e: &Engine, path: &[u8]) -> Option<String> {
     }
     #[cfg(windows)]
     {
+        if ntdll::is_wine() {
+            return None;
+        }
         let cut = last_separator(path)?;
         let taken = names_in(e, &path[..cut]);
         let mut generator = ntdll::Generator::new(&name);
@@ -2014,6 +2018,24 @@ mod ntdll {
         extension_length: u32,
         extension_buffer: [u16; 4],
         last_index_value: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleA(name: *const u8) -> *mut std::ffi::c_void;
+        fn GetProcAddress(module: *mut std::ffi::c_void, name: *const u8) -> *mut std::ffi::c_void;
+    }
+
+    /// Whether this ntdll is Wine's (Proton): it exports `wine_get_version`, Windows' does not.
+    pub fn is_wine() -> bool {
+        static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *WINE.get_or_init(|| {
+            // SAFETY: both names are NUL-terminated; ntdll is loaded in every process.
+            unsafe {
+                let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+                !ntdll.is_null() && !GetProcAddress(ntdll, b"wine_get_version\0".as_ptr()).is_null()
+            }
+        })
     }
 
     #[link(name = "ntdll")]
